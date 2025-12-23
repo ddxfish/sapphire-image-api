@@ -253,6 +253,10 @@ def serve_output_file(filename):
         if '..' in filename or filename.startswith('/'):
             return jsonify({"error": "Invalid filename"}), 400
 
+        # Auto-append .jpg if not present
+        if not filename.endswith('.jpg'):
+            filename = f"{filename}.jpg"
+
         file_path = os.path.join(output_dir, filename)
         if not os.path.exists(file_path):
             return jsonify({"error": "Image not found"}), 404
@@ -341,7 +345,7 @@ def main():
     parser.add_argument('--model', type=str, default=os.environ.get('SDXL_MODEL_PATH'),
                         help='Path to SDXL .safetensors model (or set SDXL_MODEL_PATH env var)')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Server host')
-    parser.add_argument('--port', type=int, default=5152, help='Server port')
+    parser.add_argument('--port', type=int, default=5153, help='Server port')
     parser.add_argument('--fp16', action='store_true', default=True, help='Use FP16 (default)')
     parser.add_argument('--fp32', action='store_true', help='Use FP32 instead of FP16')
 
