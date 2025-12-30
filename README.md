@@ -1,85 +1,57 @@
 # SDXL API
 
-Flask API server for SDXL image generation. Loads model once, serves fast inference via REST.
+Image generation backend for [Sapphire](https://github.com/ddxfish/sapphire). Flask REST API that loads an SDXL model once and serves fast inference. Works on Linux, may work on Windows. Requires Nvidia.
 
-**Requires CUDA GPU.**
+**Requires NVIDIA GPU with CUDA.**
 
-## Setup
+## VRAM Requirements
+
+- **~8.5 GB idle** after model load
+- **~12-15 GB peak** during generation (varies by scheduler, euler_a is lower VRAM)
+- **FP16** (default): RTX 20-series or newer
+- **FP32**: GTX 10-series and older, doubles VRAM requirements
+
+## Quickstart
 
 ```bash
+# Setup environment
+conda create -n sdxl python=3.11 -y
+conda activate sdxl
 pip install -r requirements.txt
+
+# Add your model
 mkdir models
+# Drop an SDXL .safetensors file into models/
+
+# Run
+python main.py
 ```
 
-Drop your `.safetensors` model into `models/` - it will be auto-detected on startup.
-
-## Usage
-
-```bash
-# Auto-detect single model in models/
-python sdxl_api.py
-
-# Multiple models? Specify which one
-python sdxl_api.py --model models/your_model.safetensors
-
-# Or use environment variable
-export SDXL_MODEL_PATH=/path/to/model.safetensors
-python sdxl_api.py
-
-# Custom port
-python sdxl_api.py --port 5152
-```
+Server starts on `http://localhost:5153` and has no visible UI. 
 
 ## API
 
-**POST /generate** - Start generation (async)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/generate` | POST | Start generation (returns immediately) |
+| `/image-status` | GET | Poll generation status |
+| `/latest-image` | GET | Get latest image |
+| `/output/{id}.jpg` | GET | Get specific image |
+| `/status` | GET | Server health |
+
+## Generate Request
+
 ```json
 {
   "prompt": "a cat in space",
-  "negative_prompt": "blurry, bad quality",
+  "negative_prompt": "blurry",
   "height": 1024,
   "width": 1024,
   "steps": 20,
   "guidance_scale": 7.5,
   "scale": 1.0,
-  "scheduler": "default",
-  "seed": 12345
+  "scheduler": "euler_a"
 }
 ```
-Returns `image_id` immediately. Poll `/image-status` for completion.
 
-**GET /image-status** - Check generation status  
-**GET /latest-image** - Get latest generated image  
-**GET /output/{image_id}.jpg** - Get specific image  
-**GET /status** - Server health  
-
-## Schedulers
-
-`default`, `ddim`, `euler`, `euler_a`, `dpm++`, `unipc`, `dpm++_sde_karras`, `dpm++_2m_karras`
-
-## Test with curl
-
-```bash
-# Check server status
-curl http://localhost:5152/status
-
-# Generate image
-curl -X POST http://localhost:5152/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "a cat astronaut floating in space, digital art",
-    "negative_prompt": "blurry, low quality, distorted",
-    "height": 1024,
-    "width": 1024,
-    "steps": 20,
-    "guidance_scale": 7.5,
-    "scale": 1.0,
-    "scheduler": "euler_a"
-  }'
-
-# Poll until generating=false
-curl http://localhost:5152/image-status
-
-# Download the image
-curl http://localhost:5152/latest-image -o generated.jpg
-```
+Schedulers: `default`, `ddim`, `euler`, `euler_a`, `dpm++`, `unipc`, `dpm++_sde_karras`, `dpm++_2m_karras`

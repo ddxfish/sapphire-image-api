@@ -36,6 +36,10 @@ pipe = None
 output_dir = 'output'
 os.makedirs(output_dir, exist_ok=True)
 
+# Thread safety
+state_lock = threading.Lock()
+generation_lock = threading.Lock()
+
 latest_image = {
     'data': None,
     'timestamp': None,
@@ -105,67 +109,69 @@ def generate_image_thread(unique_id, prompt, height, width, steps, guidance_scal
     global latest_image, pipe
 
     try:
-        latest_image['generating'] = True
-        latest_image['prompt'] = prompt
-        latest_image['seed'] = seed
-        latest_image['current_id'] = unique_id
+        with state_lock:
+            latest_image['generating'] = True
+            latest_image['prompt'] = prompt
+            latest_image['seed'] = seed
+            latest_image['current_id'] = unique_id
 
         generator = torch.Generator(device='cuda').manual_seed(seed)
 
-        # Swap scheduler if requested
-        original_scheduler = None
-        if scheduler != "default":
-            original_scheduler = pipe.scheduler
-            try:
-                from diffusers import (
-                    DDIMScheduler,
-                    EulerDiscreteScheduler,
-                    EulerAncestralDiscreteScheduler,
-                    DPMSolverMultistepScheduler,
-                    UniPCMultistepScheduler,
-                    DPMSolverSinglestepScheduler,
-                    KDPM2DiscreteScheduler
-                )
-
-                schedulers = {
-                    "ddim": DDIMScheduler,
-                    "euler": EulerDiscreteScheduler,
-                    "euler_a": EulerAncestralDiscreteScheduler,
-                    "dpm++": DPMSolverMultistepScheduler,
-                    "unipc": UniPCMultistepScheduler,
-                }
-
-                if scheduler in schedulers:
-                    pipe.scheduler = schedulers[scheduler].from_config(pipe.scheduler.config)
-                elif scheduler == "dpm++_sde_karras":
-                    pipe.scheduler = DPMSolverSinglestepScheduler.from_config(
-                        pipe.scheduler.config, algorithm_type="sde-dpmsolver++", use_karras_sigmas=True
-                    )
-                elif scheduler == "dpm++_2m_karras":
-                    pipe.scheduler = KDPM2DiscreteScheduler.from_config(
-                        pipe.scheduler.config, use_karras_sigmas=True
+        # Generation with lock to prevent scheduler conflicts
+        with generation_lock:
+            original_scheduler = None
+            if scheduler != "default":
+                original_scheduler = pipe.scheduler
+                try:
+                    from diffusers import (
+                        DDIMScheduler,
+                        EulerDiscreteScheduler,
+                        EulerAncestralDiscreteScheduler,
+                        DPMSolverMultistepScheduler,
+                        UniPCMultistepScheduler,
+                        DPMSolverSinglestepScheduler,
+                        KDPM2DiscreteScheduler
                     )
 
-                logger.info(f"Using scheduler: {scheduler}")
-            except Exception as e:
-                logger.warning(f"Failed to set scheduler '{scheduler}': {e}")
-                original_scheduler = None
+                    schedulers = {
+                        "ddim": DDIMScheduler,
+                        "euler": EulerDiscreteScheduler,
+                        "euler_a": EulerAncestralDiscreteScheduler,
+                        "dpm++": DPMSolverMultistepScheduler,
+                        "unipc": UniPCMultistepScheduler,
+                    }
 
-        # Generate
-        with torch.no_grad():
-            image = pipe(
-                prompt,
-                height=height,
-                width=width,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                negative_prompt=negative_prompt,
-                generator=generator
-            ).images[0]
+                    if scheduler in schedulers:
+                        pipe.scheduler = schedulers[scheduler].from_config(pipe.scheduler.config)
+                    elif scheduler == "dpm++_sde_karras":
+                        pipe.scheduler = DPMSolverSinglestepScheduler.from_config(
+                            pipe.scheduler.config, algorithm_type="sde-dpmsolver++", use_karras_sigmas=True
+                        )
+                    elif scheduler == "dpm++_2m_karras":
+                        pipe.scheduler = KDPM2DiscreteScheduler.from_config(
+                            pipe.scheduler.config, use_karras_sigmas=True
+                        )
 
-        # Restore original scheduler
-        if original_scheduler is not None:
-            pipe.scheduler = original_scheduler
+                    logger.info(f"Using scheduler: {scheduler}")
+                except Exception as e:
+                    logger.warning(f"Failed to set scheduler '{scheduler}': {e}")
+                    original_scheduler = None
+
+            # Generate
+            with torch.no_grad():
+                image = pipe(
+                    prompt,
+                    height=height,
+                    width=width,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance_scale,
+                    negative_prompt=negative_prompt,
+                    generator=generator
+                ).images[0]
+
+            # Restore original scheduler
+            if original_scheduler is not None:
+                pipe.scheduler = original_scheduler
 
         # Scale if requested
         if scale != 1.0:
@@ -184,17 +190,19 @@ def generate_image_thread(unique_id, prompt, height, width, steps, guidance_scal
         image.save(latest_path, format="JPEG", quality=95)
 
         # Update state
-        latest_image['data'] = img_str
-        latest_image['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        latest_image['image_count'] += 1
-        latest_image['generating'] = False
+        with state_lock:
+            latest_image['data'] = img_str
+            latest_image['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            latest_image['image_count'] += 1
+            latest_image['generating'] = False
 
         torch.cuda.empty_cache()
         logger.info(f"Generated [{unique_id}]: {prompt[:50]}...")
 
     except Exception as e:
         logger.error(f"Generation failed: {e}")
-        latest_image['generating'] = False
+        with state_lock:
+            latest_image['generating'] = False
 
 
 @app.route('/generate', methods=['POST'])
@@ -202,6 +210,15 @@ def generate_image_api():
     """Start image generation. Returns immediately with image_id for polling."""
     if pipe is None:
         return jsonify({"error": "Model not loaded"}), 500
+
+    # Reject if already generating
+    with state_lock:
+        if latest_image['generating']:
+            return jsonify({
+                "error": "Generation in progress",
+                "status": "busy",
+                "current_id": latest_image['current_id']
+            }), 429
 
     try:
         data = request.get_json()
@@ -269,10 +286,11 @@ def serve_output_file(filename):
 @app.route('/latest-image', methods=['GET'])
 def get_latest_image():
     """Get the most recently generated image."""
-    if latest_image['data'] is None:
-        return jsonify({"error": "No image generated yet"}), 404
+    with state_lock:
+        if latest_image['data'] is None:
+            return jsonify({"error": "No image generated yet"}), 404
+        img_data = base64.b64decode(latest_image['data'])
 
-    img_data = base64.b64decode(latest_image['data'])
     img_byte_arr = io.BytesIO(img_data)
     img_byte_arr.seek(0)
 
@@ -286,15 +304,16 @@ def get_latest_image():
 @app.route('/image-status', methods=['GET'])
 def get_image_status():
     """Poll generation status."""
-    return jsonify({
-        "has_image": latest_image['data'] is not None,
-        "timestamp": latest_image['timestamp'],
-        "prompt": latest_image['prompt'],
-        "seed": latest_image['seed'],
-        "generating": latest_image['generating'],
-        "image_count": latest_image['image_count'],
-        "image_id": latest_image['current_id']
-    })
+    with state_lock:
+        return jsonify({
+            "has_image": latest_image['data'] is not None,
+            "timestamp": latest_image['timestamp'],
+            "prompt": latest_image['prompt'],
+            "seed": latest_image['seed'],
+            "generating": latest_image['generating'],
+            "image_count": latest_image['image_count'],
+            "image_id": latest_image['current_id']
+        })
 
 
 @app.route('/status', methods=['GET'])
@@ -309,20 +328,27 @@ def status():
         "memory_reserved": f"{torch.cuda.memory_reserved(0) / 1024**3:.2f} GB",
     }
 
+    with state_lock:
+        count = latest_image['image_count']
+        generating = latest_image['generating']
+
     return jsonify({
-        "status": "ready",
+        "status": "busy" if generating else "ready",
         "device": str(pipe.device) if hasattr(pipe, 'device') else "cuda",
         "cuda_info": cuda_info,
-        "images_generated": latest_image['image_count']
+        "images_generated": count
     })
 
 
 @app.route('/', methods=['GET'])
 def root():
     """API info."""
+    with state_lock:
+        generating = latest_image['generating']
+
     return jsonify({
         "name": "SDXL API",
-        "status": "ready" if pipe is not None else "model not loaded",
+        "status": "busy" if generating else ("ready" if pipe is not None else "model not loaded"),
         "endpoints": {
             "POST /generate": "Start image generation",
             "GET /image-status": "Poll generation status",
@@ -346,7 +372,6 @@ def main():
                         help='Path to SDXL .safetensors model (or set SDXL_MODEL_PATH env var)')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Server host')
     parser.add_argument('--port', type=int, default=5153, help='Server port')
-    parser.add_argument('--fp16', action='store_true', default=True, help='Use FP16 (default)')
     parser.add_argument('--fp32', action='store_true', help='Use FP32 instead of FP16')
 
     args = parser.parse_args()
